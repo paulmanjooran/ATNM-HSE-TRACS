@@ -1,0 +1,295 @@
+// ================================================================
+// TRACS WebApp v6 — Full Backend
+// ATNM HSE Training Records & Compliance System
+// Handles: Data API + Photo Upload + Admin Approval
+//
+// DEPLOY: Execute as Me | Who has access: Anyone
+//
+// SHEET STRUCTURE (auto-created if missing):
+//   Photo Registry: ATNM_ID | Name | FileID | DriveURL | Status |
+//                   SubmittedAt | AdminEmail | ActionAt | Note
+//   Admin List:     Email | Name | AddedBy | AddedAt | Active
+//
+// DRIVE STRUCTURE (auto-created):
+//   TRACS_Photos/
+//   ├── Pending/
+//   └── Approved/
+// ================================================================
+
+const SHEET_ID      = '13IaSNS36zX3Nq9og7rr4ZdXEzw6fIvtkoJK2Dvvc1ho';
+const SAP_TAB       = 'HSE Training & FTW SAP Data';
+const MAP_TAB       = 'SAP VS Matrix Designation ';
+const REGISTRY_TAB  = 'Photo Registry';
+const ADMIN_TAB     = 'Admin List';
+const DRIVE_FOLDER  = 'TRACS_Photos';
+
+// ── ROUTER ────────────────────────────────────────────────────
+function doGet(e) {
+  const p        = e.parameter || {};
+  const action   = p.action   || '';
+  const callback = p.callback || 'tracsCB';
+
+  try {
+    switch (action) {
+      case 'upload':  return HtmlService.createHtmlOutputFromFile('UploadPage')
+                        .setTitle('TRACS — Photo Upload')
+                        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+      case 'admin':   return HtmlService.createHtmlOutputFromFile('AdminPage')
+                        .setTitle('TRACS — Admin Panel')
+                        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+      case 'pending': return _json(callback, getPendingPhotos(p.adminEmail));
+      case 'approve': return _json(callback, approvePhoto(p.rowIdx, p.adminEmail));
+      case 'reject':  return _json(callback, rejectPhoto(p.rowIdx, p.note, p.adminEmail));
+      case 'photo':   return _json(callback, getEmployeePhoto(p.atnmId));
+      default:        return buildDataResponse(callback);
+    }
+  } catch (err) {
+    return _json(callback, { success: false, error: err.toString() });
+  }
+}
+
+function _json(cb, obj) {
+  return ContentService
+    .createTextOutput(cb + '(' + JSON.stringify(obj) + ')')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+// ── DATA API (existing, unchanged from v5) ────────────────────
+function buildDataResponse(callback) {
+  const ss       = SpreadsheetApp.openById(SHEET_ID);
+  const sapSheet = ss.getSheetByName(SAP_TAB);
+  if (!sapSheet) throw new Error('Sheet not found: ' + SAP_TAB);
+
+  const lastRow = sapSheet.getLastRow();
+  const raw     = sapSheet.getRange(1, 1, lastRow, 14).getValues();
+  const sapData = [];
+
+  for (let i = 1; i < raw.length; i++) {
+    const row = raw[i];
+    if (!row[0] && !row[1] && !row[2]) continue;
+    if (String(row[11] || '').trim().toUpperCase() === 'Y') continue;
+    if (String(row[12] || '').trim() !== 'Active') continue;
+    sapData.push({
+      si:          String(row[0]  || '').trim(),
+      atnmId:      String(row[1]  || '').trim(),
+      name:        String(row[2]  || '').trim(),
+      course:      String(row[3]  || '').trim(),
+      courseCode:  String(row[4]  || '').trim(),
+      designation: String(row[5]  || '').trim(),
+      trainingDate: _fmtDate(row[7]),
+      expiryDate:   _fmtDate(row[8]),
+      cluster:     String(row[9]  || '').trim(),
+      status:      String(row[12] || '').trim()
+    });
+  }
+
+  const mapSheet = ss.getSheetByName(MAP_TAB);
+  if (!mapSheet) throw new Error('Sheet not found: ' + MAP_TAB);
+  const mapRaw = mapSheet.getRange(1, 1, mapSheet.getLastRow(), 5).getValues();
+  const designationMap = {};
+  for (let i = 3; i < mapRaw.length; i++) {
+    const k = String(mapRaw[i][2] || '').trim();
+    const v = String(mapRaw[i][3] || '').trim().replace(/^[⚠️\s]+/, '').trim();
+    if (k && v && k !== 'SAP Designation') designationMap[k] = v;
+  }
+
+  return _json(callback, {
+    success: true,
+    generatedAt: Utilities.formatDate(new Date(), 'Asia/Muscat', 'yyyy-MM-dd HH:mm'),
+    totalRecords: sapData.length,
+    sapData, designationMap
+  });
+}
+
+// ── PHOTO UPLOAD (called via google.script.run) ───────────────
+function submitPhoto(atnmId, empName, base64Data, mimeType) {
+  try {
+    if (!atnmId || !empName || !base64Data) throw new Error('Missing required fields');
+
+    const folders = _getFolders();
+    const blob    = Utilities.newBlob(
+      Utilities.base64Decode(base64Data.replace(/^data:[^;]+;base64,/, '')),
+      mimeType || 'image/jpeg',
+      'TRACS_' + atnmId + '_' + Date.now() + '.jpg'
+    );
+
+    const file    = folders.pending.createFile(blob);
+    const fileId  = file.getId();
+    const fileUrl = file.getUrl();
+
+    // Log to Photo Registry
+    const sheet = _getRegistrySheet();
+    const now   = Utilities.formatDate(new Date(), 'Asia/Muscat', 'yyyy-MM-dd HH:mm');
+    sheet.appendRow([atnmId, empName, fileId, fileUrl, 'Pending', now, '', '', '']);
+
+    return { success: true, message: 'Photo submitted for approval.' };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// ── GET PENDING PHOTOS (for admin panel) ─────────────────────
+function getPendingPhotos(adminEmail) {
+  if (!_isAdmin(adminEmail)) return { success: false, error: 'Unauthorised' };
+  const sheet = _getRegistrySheet();
+  const rows  = sheet.getDataRange().getValues();
+  const out   = [];
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][4] === 'Pending') {
+      out.push({
+        rowIdx:      i + 1,
+        atnmId:      rows[i][0],
+        name:        rows[i][1],
+        fileId:      rows[i][2],
+        submittedAt: rows[i][5],
+        thumbUrl:    _thumbUrl(rows[i][2])
+      });
+    }
+  }
+  return { success: true, pending: out };
+}
+
+// ── APPROVE PHOTO ─────────────────────────────────────────────
+function approvePhoto(rowIdx, adminEmail) {
+  if (!_isAdmin(adminEmail)) return { success: false, error: 'Unauthorised' };
+  const sheet  = _getRegistrySheet();
+  const row    = sheet.getRange(Number(rowIdx), 1, 1, 9).getValues()[0];
+  const fileId = row[2];
+  const now    = Utilities.formatDate(new Date(), 'Asia/Muscat', 'yyyy-MM-dd HH:mm');
+
+  // Move file to Approved folder
+  const file    = DriveApp.getFileById(fileId);
+  const folders = _getFolders();
+  folders.approved.addFile(file);
+  folders.pending.removeFile(file);
+
+  // Make viewable by anyone with link
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  const approvedUrl = 'https://drive.google.com/thumbnail?id=' + fileId + '&sz=w400';
+
+  // Update registry
+  sheet.getRange(Number(rowIdx), 4).setValue(approvedUrl); // DriveURL → thumbnail
+  sheet.getRange(Number(rowIdx), 5).setValue('Approved');
+  sheet.getRange(Number(rowIdx), 7).setValue(adminEmail);
+  sheet.getRange(Number(rowIdx), 8).setValue(now);
+
+  return { success: true, message: 'Photo approved.' };
+}
+
+// ── REJECT PHOTO ──────────────────────────────────────────────
+function rejectPhoto(rowIdx, note, adminEmail) {
+  if (!_isAdmin(adminEmail)) return { success: false, error: 'Unauthorised' };
+  const sheet  = _getRegistrySheet();
+  const row    = sheet.getRange(Number(rowIdx), 1, 1, 9).getValues()[0];
+  const now    = Utilities.formatDate(new Date(), 'Asia/Muscat', 'yyyy-MM-dd HH:mm');
+
+  // Delete file from Drive
+  try { DriveApp.getFileById(row[2]).setTrashed(true); } catch(e) {}
+
+  sheet.getRange(Number(rowIdx), 5).setValue('Rejected');
+  sheet.getRange(Number(rowIdx), 7).setValue(adminEmail);
+  sheet.getRange(Number(rowIdx), 8).setValue(now);
+  sheet.getRange(Number(rowIdx), 9).setValue(note || 'No reason given');
+
+  return { success: true, message: 'Photo rejected.' };
+}
+
+// ── GET EMPLOYEE PHOTO (for flash card) ──────────────────────
+function getEmployeePhoto(atnmId) {
+  const sheet = _getRegistrySheet();
+  const rows  = sheet.getDataRange().getValues();
+  // Find latest approved photo for this employee
+  for (let i = rows.length - 1; i >= 1; i--) {
+    if (String(rows[i][0]).trim() === String(atnmId).trim() && rows[i][4] === 'Approved') {
+      return { success: true, photoUrl: rows[i][3] };
+    }
+  }
+  return { success: true, photoUrl: null };
+}
+
+// ── ADMIN VALIDATION ──────────────────────────────────────────
+function validateAdmin(email) {
+  return { success: true, isAdmin: _isAdmin(email) };
+}
+
+function _isAdmin(email) {
+  if (!email) return false;
+  const ss    = SpreadsheetApp.openById(SHEET_ID);
+  let sheet   = ss.getSheetByName(ADMIN_TAB);
+  if (!sheet) {
+    sheet = ss.insertSheet(ADMIN_TAB);
+    sheet.getRange(1, 1, 1, 5).setValues([['Email','Name','Added By','Added At','Active']]);
+    const owner = Session.getEffectiveUser().getEmail();
+    sheet.appendRow([owner, 'Script Owner', 'System', new Date(), 'Y']);
+  }
+  const rows = sheet.getDataRange().getValues();
+  for (let i = 1; i < rows.length; i++) {
+    if (String(rows[i][0]).trim().toLowerCase() === email.toLowerCase() &&
+        String(rows[i][4]).trim().toUpperCase() === 'Y') return true;
+  }
+  return false;
+}
+
+// ── HELPER: Drive folders ─────────────────────────────────────
+function _getFolders() {
+  let root, pending, approved;
+  const iter = DriveApp.getFoldersByName(DRIVE_FOLDER);
+  root = iter.hasNext() ? iter.next() : DriveApp.createFolder(DRIVE_FOLDER);
+  const pi = root.getFoldersByName('Pending');
+  pending = pi.hasNext() ? pi.next() : root.createFolder('Pending');
+  const ai = root.getFoldersByName('Approved');
+  approved = ai.hasNext() ? ai.next() : root.createFolder('Approved');
+  return { root, pending, approved };
+}
+
+// ── HELPER: Photo Registry sheet ─────────────────────────────
+function _getRegistrySheet() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  let s = ss.getSheetByName(REGISTRY_TAB);
+  if (!s) {
+    s = ss.insertSheet(REGISTRY_TAB);
+    s.getRange(1, 1, 1, 9).setValues([[
+      'ATNM_ID','Employee Name','File ID','Drive URL',
+      'Status','Submitted At','Admin Email','Action At','Note'
+    ]]);
+    s.setFrozenRows(1);
+  }
+  return s;
+}
+
+// ── HELPER: Thumbnail URL ─────────────────────────────────────
+function _thumbUrl(fileId) {
+  return 'https://drive.google.com/thumbnail?id=' + fileId + '&sz=w200';
+}
+
+// ── HELPER: Date formatter ────────────────────────────────────
+function _fmtDate(val) {
+  if (!val) return '';
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return '';
+    return Utilities.formatDate(val, 'Asia/Muscat', 'yyyy-MM-dd');
+  }
+  const s = String(val).trim();
+  if (!s || s === '0') return '';
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.substring(0, 10);
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return m[3] + '-' + m[2].padStart(2,'0') + '-' + m[1].padStart(2,'0');
+  const mn = {Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',
+              Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'};
+  const m2 = s.match(/^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/);
+  if (m2 && mn[m2[2]]) return m2[3]+'-'+mn[m2[2]]+'-'+m2[1].padStart(2,'0');
+  return '';
+}
+
+// ── TEST FUNCTION ─────────────────────────────────────────────
+function testRead() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  Logger.log('Sheets: ' + ss.getSheets().map(s=>s.getName()).join(', '));
+  const result = JSON.parse(buildDataResponse('test').getContent().replace(/^test\(/,'').replace(/\)$/,''));
+  Logger.log('Success: ' + result.success);
+  Logger.log('Records: ' + result.totalRecords);
+  Logger.log('Mappings: ' + Object.keys(result.designationMap).length);
+  Logger.log('Sample: ' + JSON.stringify(result.sapData[0]));
+  Logger.log('Folders: ' + JSON.stringify(_getFolders().root.getName()));
+  Logger.log('Admin sheet: ' + _getRegistrySheet().getName());
+}
